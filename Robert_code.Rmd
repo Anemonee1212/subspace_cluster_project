@@ -1,0 +1,299 @@
+---
+title: "Robert Code"
+output: html_document
+date: '2022-06-22'
+---
+
+```{r setup, include=FALSE}
+library(data.table)
+library(ggplot2)
+library(readr)
+library(survival)
+library(survminer)
+library(tidyverse)
+```
+
+```{r}
+pdata <- read.csv("dataset/pdata.mut.csv", row.names = 1)
+expression <- read.csv("dataset/expression_mut.csv", row.names = 1)
+methylation <- read.csv("dataset/met.mut.csv", row.names = 1)
+```
+
+```{r}
+#' Combine subspaces (i.e. using Grassmann Manifold Technique
+#' - see PMID 30329022) given two different modalities of data (e.g. gene and metabolite)
+#' and the alpha value and the desired number of eigenvectors.
+#' @param type1Similarity A cosine similarity matrix for the first data type, 
+#' found using ComputeCosineSimilarity.
+#' @param type2Similarity A cosine similarity matrix for the second data type,
+#' found using ComputeCosineSimilarity.
+#' @param eigenCount The number of eigenvectors to use.
+#' @param alpha The value of alpha to use.
+#' @return A named list including the data projected onto the merged subspace,
+#' the optimal number of eigenvectors, the optimal alpha value, the clustering
+#' coefficient, and the dendrogram.
+CombineSubspaces <- function(type1Similarity, type2Similarity, eigenCount, alpha) {
+  
+  # Make graphs.
+  D_dat1 <- diag(colSums(type1Similarity))
+  D_dat2 <- diag(colSums(type2Similarity))
+  
+  # Get normalized Laplacian for each graph.
+  L_dat1 <- as.matrix(D_dat1 - type1Similarity)
+  L_dat2 <- as.matrix(D_dat2 - type2Similarity)
+  
+  # Normalize.
+  D_neg_half_dat1 <- diag(diag(1 / sqrt(abs(D_dat1))))
+  D_neg_half_dat2 <- diag(diag(1 / sqrt(abs(D_dat2))))
+  L_dat1 <- D_neg_half_dat1 %*% L_dat1 %*% D_neg_half_dat1
+  L_dat2 <- D_neg_half_dat2 %*% L_dat2 %*% D_neg_half_dat2
+  
+  # Get eigenvectors for each Laplacian.
+  U_dat1 <- eigen(L_dat1)$vectors[,c(1:eigenCount)]
+  U_dat2 <- eigen(L_dat2)$vectors[,c(1:eigenCount)]
+  
+  # Combine
+  L_mod <- L_dat1 + L_dat2 - alpha * ((U_dat1 %*% t(U_dat1)) + (U_dat2 %*% t(U_dat2)))
+  return(L_mod)
+}
+```
+
+```{r}
+#' Compute cosine similarity between samples on an adjacency matrix.
+#' @param R The adjacency matrix.
+#' @return A matrix of sample rows and sample columns, with the cosine
+#' similarities listed as the values.
+ComputeCosineSimilarity <- function(R) {
+  # Normalize matrix by the norm of its columns.
+  euclidean_norm <- sqrt(rowSums(R^2))
+  euclidean_norm_mat <- matrix(rep(euclidean_norm, ncol(R)), ncol = ncol(R))
+  R_norm <- as.matrix(R / euclidean_norm_mat)
+  
+  # Compute matrix transpose to get cosine similarity.
+  sim <- R_norm %*% t(R_norm)
+  rownames(sim) <- rownames(R)
+  colnames(sim) <- rownames(R)
+  return(sim)
+}
+```
+
+```{r}
+# Make the survival plot.
+make_surv_plot <- function(clusts, pdata) {
+  # Create a dataframe with samples, their clusters, and censoring information.
+  samps <- unlist(do.call(c, clusts))
+  
+  clust <- unlist(lapply(1:length(clusts), function(i) {
+    return(paste0("C", rep(i, length(clusts[[i]]))))
+  }))
+  
+  OS_Event <- unlist(lapply(1:length(samps), function(i) {
+    retval <- 0
+    if (pdata[samps[i], "OS_Event"] == "dead") {
+      retval <- 1
+    }
+    return(retval)
+  }))
+  time <- unlist(lapply(1:length(samps), function(i){
+    return(pdata[samps[i], "OS_Years"])
+  }))
+  dat <- data.frame("sample" = samps, "cluster" = clust, "censor" = OS_Event,
+                    "time" = time)
+  
+  # Create survival object.
+  surv <- Surv(time = dat$time, event = dat$censor)
+  dat$surv <- surv
+  
+  # Fit the survival curve.
+  fit <- survfit(formula = surv ~ cluster, data = dat)
+  return(list(fit, dat))
+}
+```
+
+```{r}
+pdata_full <- read_delim(
+  "dataset/x9802_Sampleinfo.txt", delim = "\t",
+  escape_double = FALSE, trim_ws = TRUE
+)
+pdata <- merge(pdata, pdata_full, by.x = "row.names", by.y = "DB_ID", all.x = TRUE) %>%
+  select(-contains(".y"))
+rownames(pdata) <- pdata$Row.names
+```
+
+## Data preprocessing
+
+```{r}
+transpose_dataframe <- function(data) {
+  data_t <- data.table::transpose(data)
+  colnames(data_t) <- rownames(data)
+  rownames(data_t) <- colnames(data)
+  return(data_t)
+}
+```
+
+```{r}
+exp_t <- transpose_dataframe(expression)
+met_t <- transpose_dataframe(methylation)
+data <- exp_t %>%
+  merge(met_t, by = "row.names") %>%
+  merge(pdata, by = "Row.names")
+```
+
+expression has "RACBNW", while methylation and pdata has "RACBKK", so 39 rows in total after merging
+
+```{r}
+survival_p_vals <- c()
+```
+
+## Parameter and hyperparameter initialization
+
+```{r}
+set.seed(1)
+# alpha <- 1
+# beta <- 1
+# n_eigen <- 3
+# lr <- 0.01
+N_epoch <- 1000
+```
+
+## Training session
+
+```{r}
+for (i in 1:N_epoch) {
+  # Generate clusters
+  row_nums <- sample(nrow(data), 20)
+  cluster1 <- data[row_nums, ]
+  cluster2 <- data[-row_nums, ]
+  
+  # 
+  surv_fit_dat <- make_surv_plot(list(cluster1$Row.names, cluster2$Row.names), pdata)
+  fit <- surv_fit_dat[[1]]
+  dat <- surv_fit_dat[[2]]
+  survival_p_vals <- c(survival_p_vals, surv_pvalue(fit, data = dat)$pval)
+  
+  if (i %% 100 == 0) {
+    print(ggsurvplot(fit, data = dat, pval = TRUE) + ggtitle(paste0("Split ", i)))
+  }
+  
+}
+
+p_val_data <- data.frame("p_value" = survival_p_vals)
+p_val_data %>%
+  ggplot(aes(x = p_value)) +
+    geom_density()
+```
+
+## Gradient calculation
+
+\[
+D(a, b) = \left( 1 - \left( \sum_{m = 1}^{2}{\beta_m L_m} - \sum_{m = 1}^{2}{\alpha_m U^{(m)} U^{(m)T}}
+\right) \right) _{ab}\\
+\frac{\partial}{\partial \alpha_m} D(a, b) = \left( U^{(m)} U^{(m)T} \right) _{ab} = U^{(m)}_{a \cdot}
+\cdot U^{(m)}_{b \cdot}\\
+\frac{\partial}{\partial \beta_m} D(a, b) = -(L_m)_{ab}
+\]
+
+In our context $M = 2$.
+
+```{r}
+D <- function(alpha, beta, U, L) {
+  D_a_b <- 1 - beta[[1]] * L[[1]] - beta[[2]] * L[[2]]
+  D_a_b <- D_a_b + alpha[[1]] * U[[1]] %*% t(U[[1]]) + alpha[[2]] * U[[2]] %*% t(U[[2]])
+  return(D_a_b)
+}
+
+dD_dalpha <- function(U) {
+  return(U %*% t(U))
+}
+
+dD_dbeta <- function(L) {
+  return(-L)
+}
+```
+
+\[
+Sil(c_{1i}, c_{2i}) = \frac{\sum_{a, b \in c_{1i}}{D(a, b)} + \sum_{a, b \in c_{2i}}{D(a, b)}}
+{\sum_{a \in c_{1i}, b \in c_{2i}}{D(a, b)}} := \frac{f_1(c_{1i}, c_{2i})}{g_1(c_{1i}, c_{2i})}\\
+\frac{\partial}{\partial \alpha_m} Sil(c_{1i}, c_{2i}) = f_1'g_1 - g_1'f_1g_1^2\\
+= \left( \sum_{c_{1i}}{\left( U^{(m)} U^{(m)T} \right) _{ab}} + \sum_{c_{2i}}{\left( U^{(m)} U^{(m)T}
+\right) _{ab}} \right) \cdot \sum_{c_{1i}, c_{2i}}{D(a, b)} - \sum_{c_{1i}, c_{2i}}{\left( U^{(m)}
+U^{(m)T} \right) _{ab}} \cdot \left( \sum_{c_{1i}}{D(a, b)} + \sum_{c_{2i}}{D(a, b)} \right) \left(
+\sum_{c_{1i}, c_{2i}}{D(a, b)} \right) ^ 2\\
+\frac{\partial}{\partial \beta_m} Sil(c_{1i}, c_{2i}) = - \left( \sum_{c_{1i}}{(L_m)_{ab}} +
+\sum_{c_{2i}}{(L_m)_{ab}} \right) \cdot \sum_{c_{1i}, c_{2i}}{D(a, b)} + \sum_{c_{1i}, c_{2i}}{(L_m)_{ab}}
+\cdot \left( \sum_{c_{1i}}{D(a, b)} + \sum_{c_{2i}}{D(a, b)} \right) \left( \sum_{c_{1i}, c_{2i}}{D(a, b)}
+\right) ^ 2
+\]
+
+Here $i$ is treated as a fixed constant, and $c_{1i}, c_{2i}$ both have 20 elements, so the cardinality is
+cancelled.
+
+```{r}
+f1 <- function(mat, c1) {
+  return(sum(mat[c1, c1]) + sum(mat[-c1, -c1]))
+}
+
+g1 <- function(mat, c1) {
+  return(sum(mat[c1, -c1]))
+}
+
+Sil <- function(D_mat, c1) {
+  return(f1(D_mat, c1) / g1(D_mat, c1))
+}
+
+dSil_dalpha <- function(D_mat, U, c1) {
+  return(f1(dD_dalpha(U), c1) * g1(D_mat, c1) - g1(dD_dalpha(U), c1) * f1(D_mat, c1) * g1(D_mat, c1) ^ 2)
+}
+
+dSil_dbeta <- function(D_mat, L, c1) {
+  return(f1(dD_dbeta(L), c1) * g1(D_mat, c1) - g1(dD_dbeta(L), c1) * f1(D_mat, c1) * g1(D_mat, c1) ^ 2)
+}
+```
+
+\[
+\rho = \frac{E \left[ \left( Sil(c_{1i}, c_{2i}) - E[Sil(c_{1i}, c_{2i})] \right) \left( \frac{1}{p_i} - E
+\left( \frac{1}{p} \right) \right) \right]}{\sigma_{Sil} \cdot \sigma_{\frac{1}{p}}} :=
+\frac{f_2(S_i)}{g_2(S_i)}
+\]
+
+where $S_i = Sil(c_{1i}, c_{2i})$, so given $n = 20$ and constant $p_i$'s, we have
+
+\[
+\frac{\partial f_2}{\partial S_i} = \left\{ \frac{1}{n} \sum_{k = 1}^{n}{\left[ \left( S_k - \frac{1}{n}
+\sum{S_k} \right) \left( \frac{1}{p_k} - E \left( \frac{1}{p} \right) \right) \right]} \right\}' =
+\frac{n - 1}{n^2} \left( \frac{1}{p_i} - E \left( \frac{1}{p} \right) \right)\\
+\frac{\partial f_2}{\partial \alpha_m} = \sum_{i = 1}^{n}{\frac{\partial f_2}{\partial S_i} \cdot
+\frac{\partial S_i}{\partial \alpha_m}}\\
+\frac{\partial g_2}{\partial S_i} = \left\{ \sqrt{E(S_i^2) - E(S_i)^2} \cdot \sigma_{\frac{1}{p}} \right\}'
+= \frac{\sigma_{\frac{1}{p}} \left( S_i - E(S_i) \right)}{n \sigma_{Sil}}\\
+\frac{\partial g_2}{\partial \alpha_m} = \sum_{i = 1}^{n}{\frac{\partial g_2}{\partial S_i} \cdot
+\frac{\partial S_i}{\partial \alpha_m}}
+\]
+
+```{r}
+n <- 20
+f2 <- function(silhouette, p) {
+  return(cov(silhouette, 1 / p))
+}
+
+g2 <- function(silhouette, p) {
+  return(sd(silhouette) * sd(1 / p))
+}
+
+rho <- function(silhouette, p) {
+  return(corr(silhouette, 1 / p))
+}
+
+df2_dS <- function(p) {
+  return((n - 1) * (1 / p - mean(1 / p)) / n ^ 2)
+}
+
+dg2_dS <- function(silhouette, p) {
+  return(sd(1 / p) * (silhouette - mean(silhouette)) / n / sd(silhouette))
+}
+
+df2_dalpha <- function(p) {
+  
+}
+```
+
